@@ -166,6 +166,7 @@ class SerialMultiStageEnv(gym.Env):
         self.pipeline = None           # list of arrays, each with length = lead_time[i]
         self.last_orders = None        # shape (n_stages,)
         self.rewards = None            # per-stage reward (global reward allocated)
+        self.ship = None               # realized shipment <= actual order
 
         # RNG
         self.np_random, _ = gym.utils.seeding.np_random(seed)
@@ -181,10 +182,11 @@ class SerialMultiStageEnv(gym.Env):
         customer_demand = 20  # initial placeholder
 
         # Initialize states
-        self.inventory = np.ones(self.n_stages, dtype=np.float32) * 20
+        self.inventory = np.ones(self.n_stages, dtype=np.float32) * 0
         self.backlog = np.zeros(self.n_stages, dtype=np.float32)
         self.last_orders = np.ones(self.n_stages, dtype=np.float32) * 20
         self.rewards = np.zeros(self.n_stages, dtype=np.float32)
+        self.ship = np.zeros(self.n_stages, dtype=np.float32)
 
         # Initialize pipelines (if L=0, still allocate one slot)
         self.pipeline = []
@@ -207,6 +209,8 @@ class SerialMultiStageEnv(gym.Env):
 
         self.time += 1
 
+        action_used = np.clip(action, 0.0, self.max_order)  # ✅ 关键：统一使用
+
         # 1) Receive shipments from pipeline
         self._receive_incoming_shipments()
 
@@ -214,7 +218,7 @@ class SerialMultiStageEnv(gym.Env):
         customer_demand = self.demand_gen.sample()
 
         # 3) Apply internal and external demands
-        self._apply_all_demands(customer_demand, action)
+        self._apply_all_demands(customer_demand, action_used)
 
         # 4) Place upstream orders (entering pipeline)
         self.last_orders = np.clip(action, 0.0, self.max_order)
@@ -227,10 +231,13 @@ class SerialMultiStageEnv(gym.Env):
         obs = self._get_obs(customer_demand)
         terminated = False
         truncated = self.time >= self.episode_length
+
         info = {
             "time": self.time,
             "customer_demand": customer_demand,
             "cost": global_cost,
+            "global_reward": global_reward,  # ✅ add
+            "global_cost": global_cost,  # ✅ optional but helpful
         }
 
         if self.render_mode == "human":
@@ -280,6 +287,7 @@ class SerialMultiStageEnv(gym.Env):
         # Stage 0: external customers
         total_demand_0 = self.backlog[0] + customer_demand
         ship_0 = min(self.inventory[0], total_demand_0)
+        self.ship[0] = ship_0
         self.inventory[0] -= ship_0
         self.backlog[0] = total_demand_0 - ship_0
 
@@ -289,6 +297,7 @@ class SerialMultiStageEnv(gym.Env):
             total_demand_i = self.backlog[i] + downstream_order
 
             ship_i = min(self.inventory[i], total_demand_i)
+            self.ship[i] = ship_i
             self.inventory[i] -= ship_i
             self.backlog[i] = total_demand_i - ship_i
 
@@ -299,26 +308,87 @@ class SerialMultiStageEnv(gym.Env):
         """
         for i in range(self.n_stages):
             pipe = self.pipeline[i]
-            pipe[-1] += float(orders[i])
+            # pipe[-1] += float(orders[i])
+            if i != self.n_stages - 1:
+                pipe[-1] += self.ship[i + 1]
+            else:
+                pipe[-1] += float(orders[i])
             self.pipeline[i] = pipe
+
+    # def _compute_total_cost(self) -> float:
+    #     """
+    #     Total cost = Σ_i (holding_cost_i * inventory_i + backlog_cost_i * backlog_i).
+    #
+    #     Backlog is explicitly stored; inventory is always non-negative.
+    #     """
+    #     global_cost = 0.0
+    #     for i in range(self.n_stages):
+    #         inv_pos = max(self.inventory[i], 0.0)
+    #         back = max(self.backlog[i], 0.0)
+    #
+    #         # Per-stage reward (negative of per-stage cost)
+    #         self.rewards[i] = -(self.holding_costs[i] * inv_pos +
+    #                             self.backlog_costs[i] * back)
+    #
+    #         global_cost += self.holding_costs[i] * inv_pos + \
+    #                        self.backlog_costs[i] * back
+    #
+    #     return float(global_cost)
 
     def _compute_total_cost(self) -> float:
         """
-        Total cost = Σ_i (holding_cost_i * inventory_i + backlog_cost_i * backlog_i).
+        Total cost (Clark–Scarf / Cachon–Zipkin style):
 
-        Backlog is explicitly stored; inventory is always non-negative.
+            total_cost
+            = sum_i holding_cost_i * (on_hand_i + pipeline_proxy_i)
+            + backlog_cost * customer_backlog   (ONLY ONCE)
+
+        Notes:
+        - customer_backlog = backlog[0]
+        - internal backlogs (i>0) do NOT incur backlog cost
+        - pipeline holding:
+            * stage 0: no pipeline holding added (as requested)
+            * stage i>0: add pipeline holding proxy using self.ship[i]
+              (interpreted as pipeline/flow-related inventory proxy for upstream stages)
+        - self.rewards is only for logging / per-stage decomposition
         """
-        global_cost = 0.0
+
+        # ---------- 1) holding cost ----------
+        holding_cost_total = 0.0
+
         for i in range(self.n_stages):
-            inv_pos = max(self.inventory[i], 0.0)
-            back = max(self.backlog[i], 0.0)
+            on_hand = max(float(self.inventory[i]), 0.0)
 
-            # Per-stage reward (negative of per-stage cost)
-            self.rewards[i] = -(self.holding_costs[i] * inv_pos +
-                                self.backlog_costs[i] * back)
+            # pipeline holding proxy: only for upstream stages (i>0)
+            if i > 0:
+                # pipe_proxy = max(float(self.ship[i]), 0.0)
+                pipe_proxy = max(np.sum(self.pipeline[i - 1]), 0.0)
+            else:
+                pipe_proxy = 0.0
 
-            global_cost += self.holding_costs[i] * inv_pos + \
-                           self.backlog_costs[i] * back
+            holding_cost_total += self.holding_costs[i] * (on_hand + pipe_proxy)
+
+        # ---------- 2) customer backlog cost (ONLY ONCE) ----------
+        customer_backlog = max(float(self.backlog[0]), 0.0)
+        backlog_cost_total = self.backlog_costs[0] * customer_backlog
+
+        # ---------- 3) global cost ----------
+        global_cost = holding_cost_total + backlog_cost_total
+
+        # ---------- 4) per-stage rewards (FOR LOGGING ONLY) ----------
+        # stage i: negative holding cost component (including pipeline proxy for i>0)
+        for i in range(self.n_stages):
+            on_hand = max(float(self.inventory[i]), 0.0)
+            if i > 0:
+                # pipe_proxy = max(float(self.ship[i]), 0.0)
+                pipe_proxy = max(np.sum(self.pipeline[i - 1]), 0.0)
+            else:
+                pipe_proxy = 0.0
+
+            self.rewards[i] = -(self.holding_costs[i] * (on_hand + pipe_proxy))
+
+        # assign ALL backlog cost to stage 0 (for interpretability)
+        self.rewards[0] -= backlog_cost_total
 
         return float(global_cost)
 

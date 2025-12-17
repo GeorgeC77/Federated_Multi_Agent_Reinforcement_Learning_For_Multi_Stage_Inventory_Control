@@ -2,8 +2,8 @@ from envs.serial_multi_stage import SerialMultiStageEnv
 from wrappers.multi_agent_wrapper import MultiAgentSerialWrapper
 
 env_base = SerialMultiStageEnv(
-    n_stages=2,
-    lead_times=[2, 2],  #  the real lead time = input_value + 1
+    n_stages=1,
+    lead_times=[2],  #  the real lead time = input_value + 1
     episode_length=100,
     render_mode=None,
 )

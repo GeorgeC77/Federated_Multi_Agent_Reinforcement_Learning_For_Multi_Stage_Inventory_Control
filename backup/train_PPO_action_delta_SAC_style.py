@@ -7,22 +7,27 @@ from torch.distributions import Normal
 import torch.optim as optim
 
 from envs.serial_multi_stage import SerialMultiStageEnv
-from utils.utils import RunningNormalizer   # 若不想用标准化，可以后面用 use_obs_norm=False
+from utils.utils import RunningNormalizer   # 如果不想用归一化，可以把相关调用注释掉
 
 
 # ==============================
 #  SAC-style Actor for PPO
-#  直接生成归一化动作 a_norm ∈ [-1,1]
-#  环境 action = (a_norm+1)/2 * max_action （绝对订货量，不是偏移）
 # ==============================
 
 class PPOActorSACStyle(nn.Module):
+    """
+    SAC 风格的 Actor，用在 PPO：
+    - 隐藏层: ReLU
+    - state-dependent mu / log_std + clamp 到 [-20, 2]
+    - a = tanh(u) ∈ [-1,1]
+    - logπ(a) 使用数值稳定的公式 (同 SAC/OpenAI 实现)
+    """
     def __init__(self, obs_dim, action_dim=1, max_action=40.0,
                  hidden_dim=64):
         super().__init__()
         self.max_action = max_action
 
-        # 简单两层 MLP
+        # 简单两层 MLP: obs_dim -> hidden_dim -> hidden_dim
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
             nn.ReLU(),
@@ -52,21 +57,25 @@ class PPOActorSACStyle(nn.Module):
     def forward(self, obs, deterministic=False, with_logprob=True):
         """
         返回:
-        - a_norm: tanh(u) ∈ [-1,1]   （用来映射为绝对订货量）
-        - u: pre-tanh Gaussian sample
-        - logp_pi_a: log π(a_norm)，若 with_logprob=True，否则 None
+        - a_norm: tanh(u) ∈ [-1,1]
+        - u: pre-tanh sample (同维度)
+        - logp_pi_a: log π(a_norm) 若 with_logprob=True，否则 None
+
+        注意：在训练中 logp 是对 a_norm 的概率，但用 u 来计算（数值稳定）。
         """
         dist, mu, log_std = self._dist(obs)
 
         if deterministic:
             u = mu
         else:
-            u = dist.rsample()   # 重参数技巧
+            u = dist.rsample()       # reparameterization trick
 
-        a_norm = torch.tanh(u)   # 归一化动作 ∈ [-1,1]
+        a_norm = torch.tanh(u)       # [-1,1]
 
         if with_logprob:
-            # SAC 论文中的数值稳定 logπ(a) 公式
+            # SAC 论文中的数值稳定公式
+            # log π(a) = log N(u; mu, std) - log|d tanh(u)/du|
+            # = log N(u) - (2*(log(2) - u - softplus(-2u)))
             logp_u = dist.log_prob(u).sum(dim=-1, keepdim=True)
             correction = (2 * (np.log(2) - u - F.softplus(-2 * u))).sum(
                 dim=-1, keepdim=True
@@ -90,7 +99,7 @@ class PPOActorSACStyle(nn.Module):
 
 
 # ==============================
-#  Critic network (global state value)
+#  Critic network (global)
 # ==============================
 
 class CriticNet(nn.Module):
@@ -105,7 +114,7 @@ class CriticNet(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        return self.net(x).squeeze(-1)  # (batch,)
 
 
 # ==============================
@@ -123,45 +132,34 @@ def split_obs_for_stage(global_obs, n_stages, per_stage_obs_dim, stage_id):
 
 
 # ==============================
-#  Deterministic evaluation（直接绝对 action）
+#  Evaluation: deterministic policy
 # ==============================
 
 def evaluate_policy(
     n_stages,
-    lead_times,
+    lead_time,
     actors,
     obs_normalizer=None,
     max_action=40.0,
     episode_length=100,
-    n_eval_episodes=100,
+    n_eval_episodes=10,
 ):
     """
     用确定性策略（mean action）评估当前 actors 的表现。
-    - lead_times: 可以是标量，也可以是 list，例如 [2,2]
     - actor 输出 a_norm ∈ [-1,1]
-    - 与环境交互时用 a_env = (a_norm+1)/2 * max_action （绝对订货）
-    - 若提供 obs_normalizer，则仅 normalize，不再更新统计量。
-    返回:
-    - mean_global_return: 所有 episode 的平均总 reward
-    - mean_per_stage_return: shape = (n_stages,) 每个 stage 的平均总 reward
+    - 与环境交互时用 a_env = (a_norm+1)/2 * max_action
+    - 如提供 obs_normalizer，则只做 normalize，不再更新统计量
+    返回：平均每 episode 的真实总 reward
     """
-    # 统一处理 lead_times
-    if isinstance(lead_times, (int, float)):
-        lt = [int(lead_times)] * n_stages
-    else:
-        lt = list(lead_times)
-        assert len(lt) == n_stages, f"len(lead_times)={len(lt)} must equal n_stages={n_stages}"
-
     env = SerialMultiStageEnv(
         n_stages=n_stages,
-        lead_times=lt,
+        lead_times=[lead_time] * n_stages,
         episode_length=episode_length,
         render_mode=None,
     )
 
     per_stage_obs_dim = env.per_stage_obs_dim
-    episode_returns_global = []
-    episode_returns_stage = []
+    returns = []
 
     for ep in range(n_eval_episodes):
         global_obs, info = env.reset()
@@ -174,7 +172,6 @@ def evaluate_policy(
         done = False
         truncated = False
         ep_return = 0.0
-        ep_return_stage = np.zeros(n_stages, dtype=np.float32)
 
         while not (done or truncated):
             actions_env = []
@@ -189,16 +186,13 @@ def evaluate_policy(
                 a_norm_val = float(a_norm_sid.item())
                 a_norm_val = np.clip(a_norm_val, -1.0, 1.0)
 
-                # 这里是「直接动作」：从 [-1,1] 映射到绝对订货量 [0, max_action]
                 a_env = (a_norm_val + 1.0) / 2.0 * max_action
                 actions_env.append(a_env)
 
             joint_action = np.array(actions_env, dtype=np.float32)
             next_global_obs, reward, done, truncated, info = env.step(joint_action)
 
-            # reward: shape (n_stages,)
             ep_return += float(np.sum(reward))
-            ep_return_stage += reward
 
             if obs_normalizer is not None:
                 norm_global_obs = obs_normalizer.normalize(next_global_obs)
@@ -207,21 +201,13 @@ def evaluate_policy(
 
             global_obs = next_global_obs
 
-        episode_returns_global.append(ep_return)
-        episode_returns_stage.append(ep_return_stage.copy())
+        returns.append(ep_return)
 
-        print(f"[Eval Episode {ep+1}] total return = {ep_return:.2f}, per-stage = {ep_return_stage}")
-
-    mean_global = float(np.mean(episode_returns_global))
-    mean_per_stage = np.mean(np.stack(episode_returns_stage, axis=0), axis=0)
-
-    print(f"[Eval Summary] mean total return = {mean_global:.2f}, mean per-stage = {mean_per_stage}")
-
-    return mean_global, mean_per_stage
+    return float(np.mean(returns))
 
 
 # ==============================
-#  Main Training: PPO + SAC-style Actor (直接绝对 action)
+#  Main Training: PPO
 # ==============================
 
 def train_federated_actor_critic(
@@ -233,8 +219,8 @@ def train_federated_actor_critic(
     ppo_epochs=10,
     ppo_clip=0.2,
     entropy_coef=0.01,
-    lambda_smooth=5e-3,   # 对 a_norm 的平滑正则，抑制极端动作
-    lead_times=2,         # 可以是标量，也可以是 list，例如 [2,2]
+    lambda_smooth=5e-3,   # 对 a_norm 的平滑正则
+    lead_time=2,
     max_action=40.0,
     use_obs_norm=True,
 ):
@@ -242,24 +228,13 @@ def train_federated_actor_critic(
     Federated PPO:
     - 每个 stage 一个 actor
     - critic 是 global state 的共享网络, 每轮对其做 FedAvg
-    - actor 直接输出归一化动作 a_norm，并映射为绝对订货量 action
-    - lead_times: 标量或 list（长度等于 n_stages）
+    - actor 使用 SAC 风格的 tanh + 稳定 logprob 实现
     """
-
-    # recording the best
-    eval_best = -np.inf
-
-    # 统一处理 lead_times
-    if isinstance(lead_times, (int, float)):
-        lt = [int(lead_times)] * n_stages
-    else:
-        lt = list(lead_times)
-        assert len(lt) == n_stages, f"len(lead_times)={len(lt)} must equal n_stages={n_stages}"
 
     # 1. 环境
     env = SerialMultiStageEnv(
         n_stages=n_stages,
-        lead_times=lt,
+        lead_times=[lead_time] * n_stages,
         episode_length=100,
         render_mode=None,
     )
@@ -273,16 +248,14 @@ def train_federated_actor_critic(
     else:
         obs_normalizer = None
 
-    # 2. 每个 stage 一个 actor（直接 absolute action）
+    # 2. 每个 stage 一个 actor
     actors = []
     actor_optimizers = []
     for i in range(n_stages):
-        actor = PPOActorSACStyle(
-            obs_dim=per_stage_obs_dim,
-            action_dim=1,
-            max_action=max_action,
-            hidden_dim=64,
-        )
+        actor = PPOActorSACStyle(obs_dim=per_stage_obs_dim,
+                                 action_dim=1,
+                                 max_action=max_action,
+                                 hidden_dim=64)
         actors.append(actor)
         actor_optimizers.append(optim.Adam(actor.parameters(), lr=3e-4))
 
@@ -294,8 +267,7 @@ def train_federated_actor_critic(
         print(f"\n===== Federated Round {rnd+1}/{n_rounds} =====")
 
         local_critic_params_list = []
-        round_rewards_all_steps_global = []   # 所有 step 的 global reward
-        round_rewards_all_steps_stage = []    # 所有 step 的 per-stage reward
+        round_rewards_all_steps = []
 
         # 每个 stage 当作一个 federated client
         for stage_id in range(n_stages):
@@ -328,7 +300,6 @@ def train_federated_actor_critic(
                     log_probs_tmp = []
                     u_tmp = []
 
-                    # 所有 stage 共同作用在 env 上
                     for sid in range(n_stages):
                         obs_sid = split_obs_for_stage(
                             norm_global_obs, n_stages, per_stage_obs_dim, sid
@@ -343,7 +314,6 @@ def train_federated_actor_critic(
                         a_norm_val = float(a_norm_sid.detach().numpy()[0])
                         a_norm_val = np.clip(a_norm_val, -1.0, 1.0)
 
-                        # 这里是「绝对动作」：从 [-1,1] 映射到 [0, max_action]
                         a_env = (a_norm_val + 1.0) / 2.0 * max_action
 
                         actions_env.append(a_env)
@@ -353,13 +323,17 @@ def train_federated_actor_critic(
                     joint_action = np.array(actions_env, dtype=np.float32)
                     next_global_obs, reward, done, truncated, info = env.step(joint_action)
 
-                    # reward: shape (n_stages,)
-                    # global_reward = float(np.sum(reward))
-                    global_reward = float(info["global_reward"])
+                    global_reward = np.sum(reward)
+
                     # critic 使用 global obs（可选归一化）
-                    norm_global_obs_tensor = torch.tensor(
-                        norm_global_obs, dtype=torch.float32
-                    )
+                    if obs_normalizer is not None:
+                        norm_global_obs_tensor = torch.tensor(
+                            norm_global_obs, dtype=torch.float32
+                        )
+                    else:
+                        norm_global_obs_tensor = torch.tensor(
+                            norm_global_obs, dtype=torch.float32
+                        )
 
                     value = local_critic(norm_global_obs_tensor)
 
@@ -369,7 +343,7 @@ def train_federated_actor_critic(
                     )
                     local_obs_t = torch.tensor(local_obs, dtype=torch.float32)
 
-                    # 缓存当前 stage 的轨迹（注意存的是 u 和 logπ）
+                    # 缓存当前 stage 的轨迹
                     obs_buffer.append(local_obs_t)
                     u_buffer.append(u_tmp[stage_id].detach())             # pre-tanh u
                     logprob_buffer.append(log_probs_tmp[stage_id])        # log π_old(a)
@@ -377,8 +351,7 @@ def train_federated_actor_critic(
                     value_buffer.append(value)
                     done_buffer.append(done or truncated)
 
-                    round_rewards_all_steps_global.append(global_reward)
-                    round_rewards_all_steps_stage.append(np.array(reward, dtype=np.float32))
+                    round_rewards_all_steps.append(global_reward)
 
                     # 更新 obs
                     if obs_normalizer is not None:
@@ -390,10 +363,10 @@ def train_federated_actor_critic(
                     global_obs = next_global_obs
                     norm_global_obs = norm_next_global_obs
 
-            # ============ PPO UPDATE for this stage ============
+            # ============ 3.3 PPO UPDATE for this stage ============
 
             obs_tensor = torch.stack(obs_buffer)               # (T, obs_dim_stage)
-            u_tensor = torch.stack(u_buffer)                   # (T, 1)
+            u_tensor = torch.stack(u_buffer)                   # (T, 1) pre-tanh
             old_logprobs_tensor = torch.stack(logprob_buffer).detach().squeeze(-1)  # (T,)
             rewards_tensor = torch.stack(reward_buffer)        # (T,)
             values_tensor = torch.stack(value_buffer)          # (T,)
@@ -425,14 +398,15 @@ def train_federated_actor_critic(
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             returns = returns.detach()
 
-            # a_norm 仅用于平滑正则
+            # 预计算 a_norm (仅用于 smooth penalty)
             a_norm_tensor = torch.tanh(u_tensor)  # (T,1)
 
             # ---------- PPO Optimization ----------
+            eps = 1e-6
+
             for _ in range(ppo_epochs):
                 # 当前 actor 的分布
                 dist, mu, log_std = actors[stage_id]._dist(obs_tensor)
-
                 # 用旧的 u_tensor 计算新的 logπ_new(a)
                 logp_u_new = dist.log_prob(u_tensor).sum(dim=-1, keepdim=True)
                 correction_new = (2 * (np.log(2) - u_tensor - F.softplus(-2 * u_tensor))).sum(
@@ -447,7 +421,7 @@ def train_federated_actor_critic(
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - ppo_clip, 1 + ppo_clip) * advantages
 
-                # 平滑正则：惩罚 |a_norm|^2，抑制 bang-bang
+                # 平滑正则：惩罚 |a_norm|^2，抑制极端动作倾向
                 smooth_penalty = (a_norm_tensor ** 2).mean()
 
                 actor_loss = -torch.min(surr1, surr2).mean() \
@@ -477,43 +451,34 @@ def train_federated_actor_critic(
             new_state_dict[key] /= float(len(local_critic_params_list))
         global_critic.load_state_dict(new_state_dict)
 
-        # 训练阶段的 step-avg reward（带探索噪声），打印总和和每个 stage
-        if len(round_rewards_all_steps_global) > 0:
-            avg_global = float(np.mean(round_rewards_all_steps_global))
-            stage_array = np.stack(round_rewards_all_steps_stage, axis=0)  # (num_steps, n_stages)
-            avg_stage = np.mean(stage_array, axis=0)
+        # 训练阶段的 step-avg reward（带探索噪声）
+        if len(round_rewards_all_steps) > 0:
+            avg_reward = np.mean(round_rewards_all_steps)
         else:
-            avg_global = 0.0
-            avg_stage = np.zeros(n_stages)
+            avg_reward = 0.0
+        print(f"Round {rnd+1}: approx avg step reward (stochastic, training) = {avg_reward:.2f}")
 
-        print(f"Round {rnd+1}: avg step reward (stochastic, training) = {avg_global:.2f}, "
-              f"per-stage = {avg_stage}")
-
-        # 每隔若干轮做一次 deterministic evaluation（用绝对动作）
+        # 每隔若干轮做一次 deterministic evaluation
         if (rnd + 1) % 10 == 0:
-            eval_global, eval_per_stage = evaluate_policy(
+            eval_return = evaluate_policy(
                 n_stages=n_stages,
-                lead_times=lt,
+                lead_time=lead_time,
                 actors=actors,
                 obs_normalizer=obs_normalizer if use_obs_norm else None,
                 max_action=max_action,
                 episode_length=100,
-                n_eval_episodes=100,
+                n_eval_episodes=10,
             )
-            print(f"[Eval deterministic] Round {rnd+1}: mean total return = {eval_global:.2f}, "
-                  f"mean per-stage = {eval_per_stage}")
-            if eval_global > eval_best:
-                eval_best = eval_global
-            print("best: ", eval_best)
+            print(f"[Eval deterministic] Round {rnd+1}: avg episode return = {eval_return:.2f}")
 
 
 if __name__ == "__main__":
-    # 多 stage 绝对订货量版本，例子：两级串联系统，各自 lead time = 2
+    # 先从 n_stages=1 的简单情况开始
     train_federated_actor_critic(
-        n_stages=2,
+        n_stages=1,
         n_rounds=500,
         episodes_per_round=100,
-        lead_times=[2, 2],   # 这里可以是 2 或 [2,2] 或 [2,3,...]
+        lead_time=2,
         max_action=40.0,
-        use_obs_norm=True,
+        use_obs_norm=True,   # 如果想完全回到“无标准化版本”，这里改成 False 即可
     )
